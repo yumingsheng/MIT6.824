@@ -1,64 +1,153 @@
-package mr
+package raft
 
 import (
 	"fmt"
+	"log"
+	"math/rand"
+	"sync"
+	"time"
 )
 
-type SchedulePhase uint8
+// Debugging
+const Debug = false
 
-const (
-	MapPhase SchedulePhase = iota
-	ReducePhase
-	CompletePhase
-)
-
-func (phase SchedulePhase) String() string {
-	switch phase {
-	case MapPhase:
-		return "MapPhase"
-	case ReducePhase:
-		return "ReducePhase"
-	case CompletePhase:
-		return "CompletePhase"
+func DPrintf(format string, a ...interface{}) (n int, err error) {
+	if Debug {
+		log.Printf(format, a...)
 	}
-	panic(fmt.Sprintf("unexpected SchedulePhase %d", phase))
+	return
 }
 
-type JobType uint8
+// As each Raft peer becomes aware that successive log entries are
+// committed, the peer should send an ApplyMsg to the service on
+// the same server, via the applyCh passed to Make(). Set CommandValid
+// to true to indicate that the ApplyMsg contains a newly committed
+// log entry.
+//
+// In part 2D, send other kinds of messages (e.g. snapshots) on the
+// applyCh, but set CommandValid to false for other uses.
+type ApplyMsg struct {
+	CommandValid bool
+	Command      interface{}
+	CommandTerm  int
+	CommandIndex int
 
-const (
-	MapJob JobType = iota
-	ReduceJob
-	WaitJob
-	CompleteJob
-)
+	SnapshotValid bool
+	Snapshot      []byte
+	SnapshotTerm  int
+	SnapshotIndex int
+}
 
-func (job JobType) String() string {
-	switch job {
-	case MapJob:
-		return "MapJob"
-	case ReduceJob:
-		return "ReduceJob"
-	case WaitJob:
-		return "WaitJob"
-	case CompleteJob:
-		return "CompleteJob"
+func (msg ApplyMsg) String() string {
+	if msg.CommandValid {
+		return fmt.Sprintf("{Command:%v,CommandTerm:%v,CommandIndex:%v}", 
+			msg.Command, msg.CommandTerm, msg.CommandIndex)
+	} else if msg.SnapshotValid {
+		return fmt.Sprintf("{Snapshot:%v,SnapshotTerm:%v,SnapshotIndex:%v}",
+			msg.Snapshot, msg.SnapshotTerm, msg.SnapshotIndex)
+	} else {
+		panic(fmt.Sprintf("unexpected ApplyMsg{CommandValid:%v,CommandTerm:%v,CommandIndex:%v,SnapshotValid:%v,SnapshotTerm:%v,SnapshotIndex:%v}",
+			msg.CommandValid, msg.CommandTerm, msg.CommandIndex, 
+			msg.SnapshotValid, msg.SnapshotTerm, msg.SnapshotIndex))
 	}
-	panic(fmt.Sprintf("unexpected jobType %d", job))
 }
 
-type TaskStatus uint8
+type NodeState uint8
 
 const (
-	Idle TaskStatus = iota
-	Working
-	Finished
+	StateFollower NodeState = iota
+	StateCandidate
+	StateLeader
 )
 
-func generateMapResultFileName(mapNumber, reduceNumber int) string {
-	return fmt.Sprintf("mr-%d-%d", mapNumber, reduceNumber)
+func (state NodeState) String() string {
+	switch state {
+	case StateFollower:
+		return "Follower"
+	case StateCandidate:
+		return "Candidate"
+	case StateLeader:
+		return "Leader"
+	}
+	panic(fmt.Sprintf("unexpected NodeState %d", state))
 }
 
-func generateReduceResultFileName(reduceNumber int) string {
-	return fmt.Sprintf("mr-out-%d", reduceNumber)
+type Entry struct {
+	Index  int
+	Term   int
+	Command interface{}
+}
+
+func (entry Entry) String() string {
+	return fmt.Sprintf("{Index:%v,Term:%v}",
+			entry.Index, entry.Term)
+}
+
+type lockedRand struct {
+	mu	sync.Mutex
+	rand *rand.Rand
+}
+
+func (r *lockedRand) Intn(n int) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.rand.Intn(n)
+}
+
+var globalRand = &lockedRand{
+	rand: rand.New(rand.NewSource(time.Now().UnixNano())),
+}
+
+const (
+	HeartbeatTimeout = 125
+	ElectionTimeout = 1000
+)
+
+func StableHeartbeatTimeout() time.Duration {
+	return time.Duration(HeartbeatTimeout) * time.Millisecond
+}
+
+func RandomizedElectionTimeout() time.Duration {
+	return time.Duration(ElectionTimeout + globalRand.Intn(ElectionTimeout)) * time.Millisecond
+}
+
+func Min(x, y int) int {
+	if x > y {
+		return y
+	}
+	return x
+}
+
+func Max(x, y int) int {
+	if x < y {
+		return y
+	}
+	return x
+}
+
+func insertionSort(sl []int) {
+	a, b := 0, len(sl)
+	for i := a + 1; i < b; i++ {
+		for j := i; j > a && sl[j] < sl[j - 1]; j-- {
+			sl[j], sl[j - 1] = sl[j - 1], sl[j]
+		}
+	}
+}
+
+// shrinkEntriesArray discards the underlying array used by the entries slice
+// if most of it isn't being used. This avoids holding references to a bunch of
+// potentially large entries that aren't needed anymore. Simply clearing the
+// entries wouldn't be safe because clients might still be using them.
+func shrinkEntriesArray(entries []Entry) []Entry {
+	// Replace the array if using less than half of the space in it.
+	// This number is fairly arbitrary, chosen as an attempt to balance
+	// memory usage vs number of allocations. It could probably be
+	// improved with some focused tuning.
+	const lenMultiple = 2
+	if len(entries)*lenMultiple < cap(entries) {
+		newEntries := make([]Entry, len(entries))
+		copy(newEntries, entries)
+		return newEntries
+	}
+	return entries
 }
